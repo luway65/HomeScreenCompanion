@@ -13,6 +13,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -282,6 +284,9 @@ public class HomeScreenCompanionService : IService
         private readonly IUserViewManager _userViewManager;
         private readonly ITaskManager _taskManager;
 
+        // Keep image payloads bounded to avoid memory/disk abuse from oversized uploads.
+        private const int MaxImageBytes = 10 * 1024 * 1024;
+
         public HomeScreenCompanionService(IHttpClient httpClient, IJsonSerializer jsonSerializer, IUserManager userManager, ILibraryManager libraryManager, IUserDataManager userDataManager, IUserViewManager userViewManager, ITaskManager taskManager)
         {
             _httpClient = httpClient;
@@ -336,6 +341,53 @@ public class HomeScreenCompanionService : IService
                 File.Delete(fullOldPath);
         }
 
+        private static bool IsSafeRemoteImageUrl(string url, out Uri? uri)
+        {
+            uri = null;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed))
+                return false;
+
+            if (!string.Equals(parsed.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(parsed.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            // Block direct localhost/private-network literal targets to reduce SSRF risk.
+            if (parsed.IsLoopback)
+                return false;
+
+            if (IPAddress.TryParse(parsed.Host, out var ip) && IsPrivateOrLocalIp(ip))
+                return false;
+
+            uri = parsed;
+            return true;
+        }
+
+        private static bool IsPrivateOrLocalIp(IPAddress ip)
+        {
+            if (IPAddress.IsLoopback(ip)) return true;
+
+            if (ip.AddressFamily == AddressFamily.InterNetwork)
+            {
+                var bytes = ip.GetAddressBytes();
+                if (bytes[0] == 10) return true;
+                if (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) return true;
+                if (bytes[0] == 192 && bytes[1] == 168) return true;
+                if (bytes[0] == 127) return true;
+                if (bytes[0] == 169 && bytes[1] == 254) return true;
+                return false;
+            }
+
+            if (ip.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                if (ip.IsIPv6LinkLocal || ip.IsIPv6SiteLocal || ip.IsIPv6Multicast) return true;
+                var bytes = ip.GetAddressBytes();
+                if (bytes.Length > 0 && bytes[0] == 0xfc) return true; // fc00::/7
+                if (bytes.Length > 0 && bytes[0] == 0xfd) return true; // fd00::/8
+            }
+
+            return false;
+        }
+
         public object Post(UploadCollectionImageRequest request)
         {
             try
@@ -354,9 +406,19 @@ public class HomeScreenCompanionService : IService
                 var fileName = $"{Guid.NewGuid():N}{ext}";
                 var filePath = Path.Combine(imagesDir, fileName);
 
-                File.WriteAllBytes(filePath, Convert.FromBase64String(request.Base64Data));
+                var payload = Convert.FromBase64String(request.Base64Data ?? "");
+                if (payload.Length == 0)
+                    return new UploadCollectionImageResponse { Success = false, Message = "Image payload is empty." };
+                if (payload.Length > MaxImageBytes)
+                    return new UploadCollectionImageResponse { Success = false, Message = $"Image is too large. Max size is {MaxImageBytes / (1024 * 1024)} MB." };
+
+                File.WriteAllBytes(filePath, payload);
 
                 return new UploadCollectionImageResponse { Success = true, FilePath = filePath };
+            }
+            catch (FormatException)
+            {
+                return new UploadCollectionImageResponse { Success = false, Message = "Invalid base64 image payload." };
             }
             catch (Exception ex)
             {
@@ -368,7 +430,7 @@ public class HomeScreenCompanionService : IService
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(request.Url) || !request.Url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                if (!IsSafeRemoteImageUrl(request.Url, out var remoteUri))
                     return new UploadCollectionImageResponse { Success = false, Message = "Invalid URL." };
 
                 var dataPath = Plugin.Instance?.DataFolderPath;
@@ -385,10 +447,23 @@ public class HomeScreenCompanionService : IService
                 var fileName = $"{Guid.NewGuid():N}{ext}";
                 var filePath = Path.Combine(imagesDir, fileName);
 
-                using (var stream = await _httpClient.Get(new MediaBrowser.Common.Net.HttpRequestOptions { Url = request.Url, CancellationToken = CancellationToken.None }))
+                using (var stream = await _httpClient.Get(new MediaBrowser.Common.Net.HttpRequestOptions { Url = remoteUri!.ToString(), CancellationToken = CancellationToken.None }))
                 using (var fs = File.Create(filePath))
                 {
-                    await stream.CopyToAsync(fs);
+                    var buffer = new byte[81920];
+                    int read;
+                    int total = 0;
+                    while ((read = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                    {
+                        total += read;
+                        if (total > MaxImageBytes)
+                        {
+                            fs.Close();
+                            if (File.Exists(filePath)) File.Delete(filePath);
+                            return new UploadCollectionImageResponse { Success = false, Message = $"Image is too large. Max size is {MaxImageBytes / (1024 * 1024)} MB." };
+                        }
+                        await fs.WriteAsync(buffer, 0, read);
+                    }
                 }
 
                 return new UploadCollectionImageResponse { Success = true, FilePath = filePath };
@@ -1054,7 +1129,8 @@ public class HomeScreenCompanionService : IService
 
             try
             {
-                _libraryManager.DeleteItem(item, new DeleteOptions { DeleteFileLocation = true });
+                // Remove the collection object only; never delete underlying media files.
+                _libraryManager.DeleteItem(item, new DeleteOptions { DeleteFileLocation = false });
                 return new DeleteManagedCollectionResponse { Success = true };
             }
             catch (Exception ex)
@@ -1552,16 +1628,31 @@ public class HomeScreenCompanionService : IService
             if (string.IsNullOrEmpty(path)) return null;
             if (!path.StartsWith("http", StringComparison.OrdinalIgnoreCase))
                 return File.Exists(path) ? path : null;
+            if (!IsSafeRemoteImageUrl(path, out var remoteUri))
+                return null;
             try
             {
                 var tempPath = Path.Combine(tempDir, Guid.NewGuid().ToString("N") + ".jpg");
                 using var stream = httpClient.Get(new MediaBrowser.Common.Net.HttpRequestOptions
                 {
-                    Url = path,
+                    Url = remoteUri!.ToString(),
                     CancellationToken = CancellationToken.None
                 }).GetAwaiter().GetResult();
                 using var fs = File.Create(tempPath);
-                stream.CopyTo(fs);
+                var buffer = new byte[81920];
+                int read;
+                int total = 0;
+                while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    total += read;
+                    if (total > MaxImageBytes)
+                    {
+                        fs.Close();
+                        if (File.Exists(tempPath)) File.Delete(tempPath);
+                        return null;
+                    }
+                    fs.Write(buffer, 0, read);
+                }
                 return File.Exists(tempPath) ? tempPath : null;
             }
             catch

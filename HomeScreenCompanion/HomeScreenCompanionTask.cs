@@ -149,6 +149,7 @@ namespace HomeScreenCompanion
                 var imdbLookup = new Dictionary<string, List<BaseItem>>(StringComparer.OrdinalIgnoreCase);
                 foreach (var item in allItems)
                 {
+                    if (!IsTaggableTopLevelItem(item)) continue;
                     if (item.LocationType != LocationType.FileSystem) continue;
                     if (!string.IsNullOrEmpty(item.Path) &&
                         item.Path.StartsWith(topListsFolder, StringComparison.OrdinalIgnoreCase))
@@ -156,8 +157,12 @@ namespace HomeScreenCompanion
                     var imdb = item.GetProviderId("Imdb");
                     if (!string.IsNullOrEmpty(imdb))
                     {
-                        if (!imdbLookup.ContainsKey(imdb)) imdbLookup[imdb] = new List<BaseItem>();
-                        imdbLookup[imdb].Add(item);
+                        if (!imdbLookup.TryGetValue(imdb, out var itemsForImdb))
+                        {
+                            itemsForImdb = new List<BaseItem>();
+                            imdbLookup[imdb] = itemsForImdb;
+                        }
+                        itemsForImdb.Add(item);
                     }
                 }
 
